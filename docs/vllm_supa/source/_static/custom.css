@@ -1,0 +1,30 @@
+/* Let RTD content adapt to browser width without fully filling ultra-wide screens. */
+.wy-nav-content {
+  max-width: 90vw;
+  width: auto;
+}
+
+@media screen and (min-width: 1100px) {
+  .wy-nav-content {
+    max-width: 1200px;
+  }
+}
+
+/* Avoid wide tables/code blocks breaking narrow browser layouts. */
+.rst-content table.docutils {
+  width: 100%;
+  max-width: 100%;
+}
+
+.rst-content div[class^="highlight"],
+.rst-content pre,
+.rst-content table.docutils {
+  overflow-x: auto;
+}
+
+/* Keep images and SVGs responsive. */
+.rst-content img,
+.rst-content svg {
+  max-width: 100%;
+  height: auto;
+}

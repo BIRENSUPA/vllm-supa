@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__
+*.py[cod]
+*$py.class
+
+
+# C extensions
+*.so
+*.so.*
+*.a
+*.o
+
+# supa
+*.INFO
+*.WARNING
+*.ERROR
+
+# npz
+*.npz
+
+# env
+build/
+dist/
+*.egg-info/
+# VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.cache
+.claude/worktrees
+.claude/*.json
+
+vllm_supa/version.py
+
+# local agent rules, not tracked
+.claude/CLAUDE.md
+
+logs/
+pytest.ini
+
+# Test outputs
+.pytest_cache/
+/test/perf/results/
+/test/evals/results/
+/benchmarks/results/
+
+*.lock
+.ruff_cache
+.mypy_cache

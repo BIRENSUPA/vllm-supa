@@ -1,0 +1,101 @@
+# pyproject.toml
+[build-system]
+requires = [
+    "setuptools",
+    "wheel",
+    "cmake"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+force-exclude = true
+extend-exclude = [
+    "./.git/**",
+    "./.claude/**",
+    "./cmake/**",
+    "./build/**",
+    "./patch/**",
+    "./script/**",
+    "./third-party/**",
+    "*.pyi",
+]
+
+[tool.ruff.lint]
+# Keep this list and the ignores synchronized with the existing Flake8
+# configuration. P201/P204/T484 are provided by Flake8-only plugins.
+select = ["B", "B9", "C4", "E", "EXE", "F", "G", "LOG", "RUF200", "SIM", "W"]
+external = [
+    # Rules provided by Flake8-only plugins.
+    "P201",
+    "P204",
+    "T484",
+    # Preview-only rules remain enforced by Flake8 until Ruff promotes them.
+    "B901",
+    "B909",
+    "E115",
+    "E201",
+    "E221",
+    "E225",
+    "E226",
+    "E227",
+    "E231",
+    "E241",
+    "E261",
+    "E262",
+    "E265",
+    "E266",
+    "E272",
+    "E306",
+]
+ignore = [
+    "B007",
+    "B008",
+    "C400",
+    "C401",
+    "C402",
+    "C403",
+    "C404",
+    "C405",
+    "C408",
+    "C411",
+    "C413",
+    "C414",
+    "C415",
+    "E203",
+    "E302",
+    "E303",
+    "E305",
+    "E402",
+    "E501",
+    "E721",
+    "E722",
+    "E741",
+    "EXE001",
+    "F405",
+    "F821",
+    "F841"
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"common/**/*.py" = ["F811"]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+
+[tool.mypy]
+python_version = "3.10"
+files = ["vllm_supa"]
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = true

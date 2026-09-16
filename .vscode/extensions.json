@@ -1,0 +1,13 @@
+{
+    "recommendations": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "ms-python.flake8",
+        "ms-python.debugpy",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-python.mypy-type-checker",
+        "njpwerner.autodocstring"
+    ]
+}

@@ -1,0 +1,35 @@
+{
+    "files.eol": "\n",
+    "files.insertFinalNewline": true,
+    "files.trimFinalNewlines": true,
+    "files.trimTrailingWhitespace": true,
+    "files.associations": {
+        ".flake8": "ini",
+        "*.su": "cuda-cpp",
+        "*.suh": "cuda-cpp",
+        ".clang-format": "yaml",
+        ".clang-tidy": "yaml",
+        "*requirements*.txt": "pip-requirements"
+    },
+    "[python]": {
+        "editor.tabSize": 4,
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true, // 用ruff自动化检查
+        "editor.formatOnSaveMode": "modifications",
+        "editor.inlayHints.enabled": "on"
+    },
+    "python.analysis.inlayHints.functionReturnTypes": true,
+    "flake8.importStrategy": "fromEnvironment",
+    "flake8.args": [
+        "--append-config=${workspaceFolder}/.flake8"
+    ],
+    "ruff.importStrategy": "fromEnvironment",
+    "ruff.lineLength": 120,
+    "ruff.organizeImports": false,
+    "ruff.configurationPreference": "filesystemFirst",
+    "mypy-type-checker.importStrategy": "fromEnvironment",
+    "mypy-type-checker.preferDaemon": true,
+    "mypy-type-checker.reportingScope": "workspace",
+    "autoDocstring.docstringFormat": "google",
+    "git.repositoryScanMaxDepth": 3
+}

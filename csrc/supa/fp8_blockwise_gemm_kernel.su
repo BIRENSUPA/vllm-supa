@@ -1,0 +1,405 @@
+/* Copyright (C) 2025-2026 Shanghai Biren Technology Co., Ltd. */
+
+#include <ATen/ATen.h>
+#include <device/library_types.h>
+#include <stdio.h>
+#include <supa_runtime.h>
+#include <sutlass/bfloat16.h>
+#include <sutlass/float8.h>
+#include <torch/all.h>
+#include <torch_supa/csrc/core/supa/SUPAContext.h>
+#include <torch_supa/csrc/core/supa/SUPAGuard.h>
+
+#include <sute/layout.hpp>
+#include <sute/numeric/integral_constant.hpp>
+#include <sute/tensor.hpp>
+#include <sutlass/epilogue/collective/collective_builder.hpp>
+#include <sutlass/epilogue/collective/collective_epilogue.hpp>
+#include <sutlass/epilogue/fusion/operations.hpp>
+#include <sutlass/gemm/collective/collective_builder.hpp>
+#include <sutlass/gemm/device/gemm_universal.hpp>
+#include <sutlass/gemm/dispatch_policy.hpp>
+#include <sutlass/gemm/kernel/gemm_universal.hpp>
+#include <sutlass/gemm/legacy_layout.hpp>
+#include <sutlass/util/memory_buffer.hpp>
+#include <sutlass/util/tensor/io.hpp>
+
+
+void sublas_fp8_scaled_mm(
+    const void* __restrict__ ptr_A,
+    const void* __restrict__ ptr_B,
+    void* __restrict__ ptr_D,
+    const void* __restrict__ ptr_scale_A,
+    const void* __restrict__ ptr_scale_B,
+    const void* __restrict__ ptr_C,
+    float beta,
+    int m,
+    int n,
+    int k,
+    const int quant_type,
+    supaDataType out_type,
+    supaStream_t stream,
+    int32_t batch = 1,
+    at::Tensor workspace_buffer = at::Tensor(),
+    int64_t sublas_handle = -1);
+
+using namespace sute;
+
+template <typename OutType, typename ScheduleConfig, typename LayoutD>
+void sutlass_launch_fp8_blockwise_scaled_mm(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& out,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    int m,
+    int n,
+    int k,
+    supaStream_t stream) {
+  using ElementA = sutlass::float_e4m3_t;
+  using ElementB = sutlass::float_e4m3_t;
+  using ElementC = void;
+  using ElementD = OutType;
+  using ElementAccumulator = float;
+  using LayoutA = sutlass::layout::RowMajor;
+  using LayoutB = sutlass::layout::ColumnMajor;
+  // using LayoutD = sutlass::layout::RowMajor;
+  using LayoutSFA = typename ScheduleConfig::LayoutSFA;
+  using LayoutSFB = typename ScheduleConfig::LayoutSFB;
+
+  static constexpr int AlignmentA = 128 / sutlass::sizeof_bits<ElementA>::value;
+  static constexpr int AlignmentB = 128 / sutlass::sizeof_bits<ElementB>::value;
+  static constexpr int AlignmentD = 128 / sutlass::sizeof_bits<ElementD>::value;
+
+  using ArchTag = sutlass::arch::Arch20;
+  using OperatorClass = sutlass::arch::OpClassTensorOp;
+  using EpilogueScheduleType = sutlass::epilogue::TmaWarpSpecializedIndependentCooperative;
+  using FusionOp = sutlass::epilogue::fusion::OnlyAcc<ElementD>;
+
+  using CollectiveEpilogue = typename sutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      typename ScheduleConfig::MmaTileShape,
+      typename ScheduleConfig::ClusterShape,
+      typename ScheduleConfig::EpilogueTileType,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,  // Use void to avoid load Matrix C
+      LayoutD,
+      AlignmentD,
+      ElementD,
+      LayoutD,
+      AlignmentD,
+      EpilogueScheduleType,
+      FusionOp>::CollectiveOp;
+
+  using StageCountType = sutlass::gemm::collective::StageCountAutoCarveout<
+      sizeof(typename CollectiveEpilogue::SharedStorage::SmemBufferC),
+      sizeof(typename CollectiveEpilogue::SharedStorage::SmemBufferD),
+      sizeof(typename CollectiveEpilogue::SharedStorage::AuxiliaryStorage)>;
+
+  using CollectiveMainloop = typename sutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      tuple<LayoutA, LayoutSFA>,
+      AlignmentA,
+      ElementB,
+      tuple<LayoutB, LayoutSFB>,
+      AlignmentB,
+      ElementAccumulator,
+      typename ScheduleConfig::MmaTileShape,
+      typename ScheduleConfig::ClusterShape,
+      StageCountType,
+      typename ScheduleConfig::KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = sutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int>,  // dynamic 3d problem size for M, N, K
+      CollectiveMainloop,
+      CollectiveEpilogue>;
+
+  using Gemm = sutlass::gemm::device::GemmUniversal<GemmKernel>;
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideC = typename GemmKernel::StrideC;
+  using StrideD = typename GemmKernel::StrideD;
+  using ProblemShape = typename GemmKernel::ProblemShape;
+  ProblemShape problem_shape = make_tuple(m, n, k);
+
+  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
+  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
+  auto scales_a_ptr = static_cast<float*>(scales_a.data_ptr());
+  auto scales_b_ptr = static_cast<float*>(scales_b.data_ptr());
+  auto d_ptr = static_cast<ElementD*>(out.data_ptr());
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideD = typename GemmKernel::StrideD;
+
+  auto canonical_layout =
+      sutlass::CanonicalLayoutFactory<LayoutA, LayoutB, LayoutD, LayoutD, decltype(problem_shape)>(problem_shape);
+  auto layout_A = canonical_layout.layout_a(AlignmentA);
+  auto layout_B = canonical_layout.layout_b(AlignmentB);
+  auto layout_D = canonical_layout.layout_d(AlignmentD);
+  auto layout_ScalarA = ScheduleConfig::ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  auto layout_ScalarB = ScheduleConfig::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+
+  typename Gemm::Arguments args{
+      sutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,  // problem shape
+      {
+          a_ptr,
+          layout_A.stride(),
+          b_ptr,
+          layout_B.stride(),
+          scales_a_ptr,
+          layout_ScalarA,
+          scales_b_ptr,
+          layout_ScalarB,
+      },  // mainloop
+      {
+          {},
+          d_ptr,
+          layout_D.stride(),
+          d_ptr,
+          layout_D.stride(),
+      },  // epilogue
+      {},
+      {}};
+
+  Gemm gemm_op;
+
+  auto can_implement = gemm_op.can_implement(args);
+  TORCH_CHECK(can_implement == sutlass::Status::kSuccess, "Failed to implement GEMM")
+
+  size_t workspace_size = gemm_op.get_workspace_size(args);
+  sutlass::DeviceSharedBuffer workspace = sutlass::make_device_shared_buffer<uint8_t>(workspace_size);
+
+  auto init_status = gemm_op.initialize(args, workspace.get());
+  TORCH_CHECK(init_status == sutlass::Status::kSuccess, "Failed to initialize GEMM");
+
+  auto status = gemm_op.run(stream);
+  TORCH_CHECK(status == sutlass::Status::kSuccess, "Failed to run GEMM")
+}
+
+template <typename OutType>
+void sutlass_fp8_blockwise_scaled_mm(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& out,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    int m,
+    int n,
+    int k,
+    supaStream_t stream) {
+  struct MmaConfigTmaScale {
+    using ElementA = sutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _128, _256>;
+    using ClusterShape = Shape<_2, _2, _1>;
+    using EpilogueTileType = Shape<_128, _64>;
+    using KernelSchedule = sutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccumTmaScale;
+    using ScaleConfig = sutlass::detail::Arch20_BlockwiseScaleConfig<1, 128, 128, GMMA::Major::MN, GMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+  struct MmaConfigMNMajor {
+    using ElementA = sutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _128, _128>;
+    using ClusterShape = Shape<_2, _2, _1>;
+    using EpilogueTileType = Shape<_128, _64>;
+    using KernelSchedule = sutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+    using ScaleConfig = sutlass::detail::Arch20_BlockwiseScaleConfig<1, 128, 128, GMMA::Major::MN, GMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+  struct MmaConfigKMajor {
+    using ElementA = sutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _128, _128>;
+    using ClusterShape = Shape<_2, _2, _1>;
+    using EpilogueTileType = Shape<_128, _64>;
+    using KernelSchedule = sutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+    using ScaleConfig = sutlass::detail::Arch20_BlockwiseScaleConfig<1, 128, 128, GMMA::Major::K, GMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+  if (scales_a.size(1) % 4 != 0) {
+    torch::Tensor sfa = scales_a.contiguous();
+    sutlass_launch_fp8_blockwise_scaled_mm<OutType, MmaConfigKMajor, sutlass::layout::RowMajor>(a, b, out, sfa, scales_b, m, n, k, stream);
+  } else if (scales_a.size(0) % 4 != 0) {
+    sutlass_launch_fp8_blockwise_scaled_mm<OutType, MmaConfigMNMajor, sutlass::layout::RowMajor>(a, b, out, scales_a, scales_b, m, n, k, stream);
+  } else {
+    sutlass_launch_fp8_blockwise_scaled_mm<OutType, MmaConfigTmaScale, sutlass::layout::RowMajor>(a, b, out, scales_a, scales_b, m, n, k, stream);
+  }
+}
+
+template <typename OutType>
+void sutlass_fp8_blockwise_scaled_mm_T(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& out,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    int m,
+    int n,
+    int k,
+    supaStream_t stream) {
+  struct MmaConfigTmaScale {
+    using ElementA = sutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _32, _256>;
+    using ClusterShape = Shape<_1, _1, _1>;
+    using EpilogueTileType = Shape<_128, _32>;
+    using KernelSchedule = sutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccumTmaScale;
+    using ScaleConfig = sutlass::detail::Arch20_BlockwiseScaleConfig<128, 1, 128, GMMA::Major::K, GMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+  struct MmaConfigKMajor {
+    using ElementA = sutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _32, _128>;
+    using ClusterShape = Shape<_1, _1, _1>;
+    using EpilogueTileType = Shape<_128, _32>;
+    using KernelSchedule = sutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+    using ScaleConfig = sutlass::detail::Arch20_BlockwiseScaleConfig<128, 1, 128, GMMA::Major::K, GMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+  torch::Tensor a_t = a.t();
+  torch::Tensor b_t = b.t();
+  torch::Tensor sfa = scales_a.contiguous();
+  torch::Tensor sfa_t = sfa.t();
+  torch::Tensor scales_b_t = scales_b.t();
+  torch::Tensor out_t = out.t();
+  if (scales_a.size(1) % 4 != 0) {
+    sutlass_launch_fp8_blockwise_scaled_mm<OutType, MmaConfigKMajor, sutlass::layout::ColumnMajor>(
+        b_t, a_t, out_t, scales_b_t, sfa_t, n, m, k, stream);
+  } else {
+    sutlass_launch_fp8_blockwise_scaled_mm<OutType, MmaConfigTmaScale, sutlass::layout::ColumnMajor>(
+        b_t, a_t, out_t, scales_b_t, sfa_t, n, m, k, stream);
+  }
+  out = out_t.t();
+}
+
+void fp8_blockwise_scaled_mm(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,     // shape: [m, k], stride: (k, 1)
+    const torch::Tensor& mat_b,     // shape: [k, n], stride: (1, k)
+    const torch::Tensor& scales_a,  // shape: [m, k/128], stride: (1, m)
+    const torch::Tensor& scales_b) {
+  TORCH_CHECK(mat_a.dim() == 2, "mat_a must be 2D tensor");
+  TORCH_CHECK(mat_b.dim() == 2, "mat_b must be 2D tensor");
+  TORCH_CHECK(out.dim() == 2, "out must be a 2D tensor");
+  TORCH_CHECK(out.stride(1) == 1, "out must be a row major tensor");
+
+  const int64_t m = mat_a.size(0);
+  const int64_t k = mat_a.size(1);
+  const int64_t n = mat_b.size(1);
+  const int64_t kk = (k + 127) / 128;
+
+  TORCH_CHECK(out.size(0) == m && out.size(1) == n, "out has incorrect shape");
+  TORCH_CHECK(mat_b.size(0) == k, "mat_b must have shape [k, n]");
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must have stride (1, k)");
+  TORCH_CHECK(scales_b.size(0) == kk, "scales_b must have shape [k/128, n/128]");
+  TORCH_CHECK(scales_b.stride(0) == 1, "scales_b must have stride (1, k/128)");
+  TORCH_CHECK(out.scalar_type() == torch::kHalf || out.scalar_type() == torch::kBFloat16,
+              "out must be Half or BFloat16");
+
+  if (m != 1) {
+    TORCH_CHECK(scales_a.stride(0) == 1, "scales_a must have stride (1, m)");
+  }
+
+  supaStream_t stream = c10::supa::getCurrentSUPAStream().stream();
+  c10::supa::OptionalSUPAGuard device_guard(mat_a.device());
+  const bool small_m = m <= 2048;
+  if (small_m) {
+    if (out.scalar_type() == torch::kBFloat16) {
+      sutlass_fp8_blockwise_scaled_mm_T<sutlass::bfloat16_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+    } else {
+      sutlass_fp8_blockwise_scaled_mm_T<sutlass::half_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+    }
+  } else {
+    if (out.scalar_type() == torch::kBFloat16) {
+      sutlass_fp8_blockwise_scaled_mm<sutlass::bfloat16_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+    } else {
+      sutlass_fp8_blockwise_scaled_mm<sutlass::half_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+    }
+  }
+}
+
+torch::Tensor supa_fp8_blockwise_scaled_mm(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,     // shape: [m, k], stride: (k, 1)
+    const torch::Tensor& mat_b,     // shape: [k, n], stride: (1, k)
+    const torch::Tensor& scales_a,  // shape: [m, k/128], stride: (1, m)
+    const torch::Tensor& scales_b) {  // shape: [n/128, k/128], stride: (k/128, 1)
+  TORCH_CHECK(mat_a.dim() == 2, "mat_a must be 2D tensor");
+  TORCH_CHECK(mat_b.dim() == 2, "mat_b must be 2D tensor");
+  TORCH_CHECK(out.dim() == 2, "out must be a 2D tensor");
+  const int64_t m = mat_a.size(0);
+  const int64_t k = mat_a.size(1);
+  const int64_t n = mat_b.size(1);
+  const int64_t kk = (k + 127) / 128;
+  TORCH_CHECK(out.size(0) == m && out.size(1) == n, "out has incorrect shape");
+  TORCH_CHECK(mat_b.size(0) == k, "mat_b must have shape [k, n]");
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must have stride (1, k)");
+  TORCH_CHECK(scales_b.size(0) == kk, "scales_b must have shape [k/128, n/128]");
+  TORCH_CHECK(scales_b.stride(0) == 1, "scales_b must have stride (1, k/128)");
+  TORCH_CHECK(out.scalar_type() == torch::kHalf || out.scalar_type() == torch::kBFloat16,
+              "out must be Half or BFloat16");
+  if (m != 1) {
+    TORCH_CHECK(scales_a.stride(0) == 1, "scales_a must have stride (1, m)");
+  }
+  supaStream_t stream = c10::supa::getCurrentSUPAStream().stream();
+  c10::supa::OptionalSUPAGuard device_guard(mat_a.device());
+
+  if (m % 4 == 0 && kk % 4 == 0) {
+    if (out.scalar_type() == torch::kBFloat16) {
+      sublas_fp8_scaled_mm(
+          mat_a.data_ptr(),
+          mat_b.data_ptr(),
+          out.data_ptr(),
+          scales_a.data_ptr(),
+          scales_b.data_ptr(),
+          NULL,
+          0.0f,
+          m,
+          n,
+          k,
+          0,
+          SUPA_R_16BF,
+          stream);
+    } else {
+      sublas_fp8_scaled_mm(
+          mat_a.data_ptr(),
+          mat_b.data_ptr(),
+          out.data_ptr(),
+          scales_a.data_ptr(),
+          scales_b.data_ptr(),
+          NULL,
+          0.0f,
+          m,
+          n,
+          k,
+          0,
+          SUPA_R_16F,
+          stream);
+    }
+  } else {
+    const bool small_m = m <= 2048;
+    if (small_m) {
+      if (out.scalar_type() == torch::kBFloat16) {
+        sutlass_fp8_blockwise_scaled_mm_T<sutlass::bfloat16_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+      } else {
+        sutlass_fp8_blockwise_scaled_mm_T<sutlass::half_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+      }
+    } else {
+      if (out.scalar_type() == torch::kBFloat16) {
+        sutlass_fp8_blockwise_scaled_mm<sutlass::bfloat16_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+      } else {
+        sutlass_fp8_blockwise_scaled_mm<sutlass::half_t>(mat_a, mat_b, out, scales_a, scales_b, m, n, k, stream);
+      }
+    }
+  }
+  return out;
+}
