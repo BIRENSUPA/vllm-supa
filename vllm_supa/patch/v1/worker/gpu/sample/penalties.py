@@ -1,4 +1,4 @@
-# Copyright (C) 2025-2026 Shanghai Biren Technology Co., Ltd.
+# Copyright (C) 2020-2026 Shanghai Biren Technology Co., Ltd.
 
 import vllm.v1.worker.gpu.sample.penalties as penalties_module
 from vllm.triton_utils import tl, triton

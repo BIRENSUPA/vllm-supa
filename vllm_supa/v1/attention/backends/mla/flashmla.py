@@ -1,4 +1,4 @@
-# Copyright (C) 2025-2026 Shanghai Biren Technology Co., Ltd.
+# Copyright (C) 2020-2026 Shanghai Biren Technology Co., Ltd.
 
 from vllm_supa.v1.attention.ops import flashmla as _flashmla  # noqa: F401
 from vllm.v1.attention.backends.mla import flashmla

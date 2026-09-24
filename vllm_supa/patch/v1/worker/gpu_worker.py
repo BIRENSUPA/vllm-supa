@@ -1,4 +1,4 @@
-# Copyright (C) 2025-2026 Shanghai Biren Technology Co., Ltd.
+# Copyright (C) 2020-2026 Shanghai Biren Technology Co., Ltd.
 """Patch vllm.v1.worker.gpu_worker.Worker.determine_available_memory.
 
 When env var VLLM_SUPA_SKIP_PROFILE_RUN=1 AND cache_config.kv_cache_memory_bytes
